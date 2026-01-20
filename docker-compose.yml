@@ -1,0 +1,7 @@
+version: '3'
+services:
+  app:
+    image: nginx:latest  # 테스트용, 나중에 본인 이미지로 변경
+    ports:
+      - "8080:80"
+    restart: always
