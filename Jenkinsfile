@@ -6,7 +6,7 @@ pipeline {
             steps {
                 git branch: 'main',
                     credentialsId: 'github-token',
-                    url: 'https://github.com/your-username/your-repo.git'
+                    url: 'https://github.com/thermoCat/jenkins-test'
             }
         }
         
