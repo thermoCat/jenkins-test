@@ -105,6 +105,7 @@
         let ws;
         let localStream;
         let peerConnections = {};
+        let pendingIceCandidates = {};  // Buffer for ICE candidates before PC is ready
         let roomId;
         let isMuted = false;
         let isVideoOff = false;
@@ -113,8 +114,27 @@
         const configuration = {
             iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' },
-                { urls: 'stun:stun1.l.google.com:19302' }
-            ]
+                { urls: 'stun:stun1.l.google.com:19302' },
+                { urls: 'stun:stun2.l.google.com:19302' },
+                { urls: 'stun:stun3.l.google.com:19302' },
+                // OpenRelay TURN servers (free, for testing)
+                {
+                    urls: 'turn:openrelay.metered.ca:80',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
+                },
+                {
+                    urls: 'turn:openrelay.metered.ca:443',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
+                },
+                {
+                    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
+                }
+            ],
+            iceCandidatePoolSize: 10
         };
 
         // Load rooms on page load and check URL for room
@@ -286,6 +306,9 @@
                 console.log('Received:', message);
 
                 switch (message.type) {
+                    case 'room-info':
+                        await handleRoomInfo(message);
+                        break;
                     case 'user-joined':
                         await handleUserJoined(message.senderId);
                         break;
@@ -341,48 +364,162 @@
             }
         };
 
-        async function handleUserJoined(peerId) {
-            console.log('User joined:', peerId);
+        // Handle room-info: connect to all existing participants
+        async function handleRoomInfo(message) {
+            const existingParticipants = message.participants || [];
+            console.log('Room info received. Existing participants:', existingParticipants);
+
+            // Connect to each existing participant with a small delay to avoid race conditions
+            for (let i = 0; i < existingParticipants.length; i++) {
+                const peerId = existingParticipants[i];
+                // Stagger connections to prevent overwhelming
+                setTimeout(() => {
+                    initiateConnection(peerId);
+                }, i * 200);
+            }
+        }
+
+        // Initiate connection to a peer (create offer)
+        async function initiateConnection(peerId) {
+            console.log('Initiating connection to:', peerId);
+
+            // Don't create duplicate connections
+            if (peerConnections[peerId]) {
+                console.log('Connection already exists for:', peerId);
+                return;
+            }
+
             const pc = createPeerConnection(peerId);
 
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
+            try {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
 
-            ws.send(JSON.stringify({
-                type: 'offer',
-                targetId: peerId,
-                roomId: roomId,
-                payload: offer
-            }));
+                ws.send(JSON.stringify({
+                    type: 'offer',
+                    targetId: peerId,
+                    roomId: roomId,
+                    payload: offer
+                }));
+            } catch (err) {
+                console.error('Failed to create offer for', peerId, err);
+                // Cleanup on failure
+                if (peerConnections[peerId]) {
+                    peerConnections[peerId].close();
+                    delete peerConnections[peerId];
+                }
+            }
+        }
+
+        async function handleUserJoined(peerId) {
+            console.log('User joined:', peerId);
+
+            // Don't create duplicate connections
+            if (peerConnections[peerId]) {
+                console.log('Connection already exists for:', peerId);
+                return;
+            }
+
+            const pc = createPeerConnection(peerId);
+
+            try {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                ws.send(JSON.stringify({
+                    type: 'offer',
+                    targetId: peerId,
+                    roomId: roomId,
+                    payload: offer
+                }));
+            } catch (err) {
+                console.error('Failed to create offer for', peerId, err);
+            }
         }
 
         async function handleOffer(message) {
             const peerId = message.senderId;
+
+            // If we already have a connection, close it and recreate
+            if (peerConnections[peerId]) {
+                console.log('Replacing existing connection for:', peerId);
+                peerConnections[peerId].close();
+                delete peerConnections[peerId];
+                // Remove existing video element
+                const existingVideo = document.getElementById('video-' + peerId);
+                if (existingVideo) existingVideo.remove();
+            }
+
             const pc = createPeerConnection(peerId);
 
-            await pc.setRemoteDescription(new RTCSessionDescription(message.payload));
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
+            try {
+                await pc.setRemoteDescription(new RTCSessionDescription(message.payload));
+                // Process any buffered ICE candidates
+                await processPendingIceCandidates(peerId);
 
-            ws.send(JSON.stringify({
-                type: 'answer',
-                targetId: peerId,
-                roomId: roomId,
-                payload: answer
-            }));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+
+                ws.send(JSON.stringify({
+                    type: 'answer',
+                    targetId: peerId,
+                    roomId: roomId,
+                    payload: answer
+                }));
+            } catch (err) {
+                console.error('Failed to handle offer from', peerId, err);
+            }
         }
 
         async function handleAnswer(message) {
-            const pc = peerConnections[message.senderId];
+            const peerId = message.senderId;
+            const pc = peerConnections[peerId];
             if (pc) {
-                await pc.setRemoteDescription(new RTCSessionDescription(message.payload));
+                try {
+                    await pc.setRemoteDescription(new RTCSessionDescription(message.payload));
+                    // Process any buffered ICE candidates
+                    await processPendingIceCandidates(peerId);
+                } catch (err) {
+                    console.error('Failed to handle answer from', peerId, err);
+                }
             }
         }
 
         async function handleIceCandidate(message) {
-            const pc = peerConnections[message.senderId];
-            if (pc && message.payload) {
-                await pc.addIceCandidate(new RTCIceCandidate(message.payload));
+            const peerId = message.senderId;
+            const pc = peerConnections[peerId];
+
+            if (pc && pc.remoteDescription && message.payload) {
+                try {
+                    await pc.addIceCandidate(new RTCIceCandidate(message.payload));
+                } catch (err) {
+                    console.error('Error adding ICE candidate:', err);
+                }
+            } else if (message.payload) {
+                // Buffer the ICE candidate for later
+                console.log('Buffering ICE candidate for:', peerId);
+                if (!pendingIceCandidates[peerId]) {
+                    pendingIceCandidates[peerId] = [];
+                }
+                pendingIceCandidates[peerId].push(message.payload);
+            }
+        }
+
+        // Process buffered ICE candidates after remote description is set
+        async function processPendingIceCandidates(peerId) {
+            const pc = peerConnections[peerId];
+            const candidates = pendingIceCandidates[peerId] || [];
+
+            if (pc && candidates.length > 0) {
+                console.log('Processing', candidates.length, 'buffered ICE candidates for:', peerId);
+                for (const candidate of candidates) {
+                    try {
+                        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                    } catch (err) {
+                        console.error('Error adding buffered ICE candidate:', err);
+                    }
+                }
+                delete pendingIceCandidates[peerId];
             }
         }
 
@@ -392,6 +529,9 @@
                 peerConnections[peerId].close();
                 delete peerConnections[peerId];
             }
+            // Clean up buffered ICE candidates
+            delete pendingIceCandidates[peerId];
+
             const videoContainer = document.getElementById('video-' + peerId);
             if (videoContainer) {
                 videoContainer.remove();
@@ -399,6 +539,7 @@
         }
 
         function createPeerConnection(peerId) {
+            console.log('Creating peer connection for:', peerId);
             const pc = new RTCPeerConnection(configuration);
             peerConnections[peerId] = pc;
 
@@ -418,6 +559,7 @@
             };
 
             pc.ontrack = (event) => {
+                console.log('Received track from:', peerId);
                 let videoContainer = document.getElementById('video-' + peerId);
                 if (!videoContainer) {
                     videoContainer = document.createElement('div');
@@ -432,8 +574,15 @@
                     label.className = 'video-label';
                     label.textContent = 'Remote User';
 
+                    // Add connection status indicator
+                    const statusIndicator = document.createElement('div');
+                    statusIndicator.className = 'connection-status';
+                    statusIndicator.id = 'status-' + peerId;
+                    statusIndicator.style.cssText = 'position:absolute;top:10px;right:10px;width:12px;height:12px;border-radius:50%;background:#ffa502;';
+
                     videoContainer.appendChild(video);
                     videoContainer.appendChild(label);
+                    videoContainer.appendChild(statusIndicator);
                     document.getElementById('videoGrid').appendChild(videoContainer);
                 }
 
@@ -441,11 +590,65 @@
                 video.srcObject = event.streams[0];
             };
 
+            // ICE connection state monitoring
+            pc.oniceconnectionstatechange = () => {
+                console.log('ICE connection state for', peerId, ':', pc.iceConnectionState);
+                updateConnectionStatus(peerId, pc.iceConnectionState);
+
+                if (pc.iceConnectionState === 'failed') {
+                    console.log('ICE connection failed, attempting restart for:', peerId);
+                    pc.restartIce();
+                }
+
+                if (pc.iceConnectionState === 'disconnected') {
+                    // Give it some time before cleaning up
+                    setTimeout(() => {
+                        if (peerConnections[peerId] && peerConnections[peerId].iceConnectionState === 'disconnected') {
+                            console.log('Connection still disconnected, attempting restart for:', peerId);
+                            pc.restartIce();
+                        }
+                    }, 3000);
+                }
+            };
+
             pc.onconnectionstatechange = () => {
-                console.log('Connection state:', pc.connectionState);
+                console.log('Connection state for', peerId, ':', pc.connectionState);
+
+                if (pc.connectionState === 'failed') {
+                    console.log('Connection failed for:', peerId);
+                    handleUserLeft(peerId);
+                }
+            };
+
+            // Negotiation needed (for renegotiation)
+            pc.onnegotiationneeded = async () => {
+                console.log('Negotiation needed for:', peerId);
             };
 
             return pc;
+        }
+
+        function updateConnectionStatus(peerId, state) {
+            const statusEl = document.getElementById('status-' + peerId);
+            if (statusEl) {
+                switch (state) {
+                    case 'connected':
+                    case 'completed':
+                        statusEl.style.background = '#2ed573';
+                        break;
+                    case 'checking':
+                    case 'new':
+                        statusEl.style.background = '#ffa502';
+                        break;
+                    case 'disconnected':
+                        statusEl.style.background = '#ff6b6b';
+                        break;
+                    case 'failed':
+                    case 'closed':
+                        statusEl.style.background = '#ff4757';
+                        break;
+                }
+            }
         }
 
         function leaveRoom() {
@@ -459,6 +662,7 @@
 
             Object.values(peerConnections).forEach(pc => pc.close());
             peerConnections = {};
+            pendingIceCandidates = {};
 
             if (localStream) {
                 localStream.getTracks().forEach(track => track.stop());

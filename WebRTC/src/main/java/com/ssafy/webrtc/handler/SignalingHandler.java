@@ -53,21 +53,31 @@ public class SignalingHandler extends TextWebSocketHandler {
         String roomId = message.getRoomId();
         String sessionId = session.getId();
 
+        // Get existing participants BEFORE joining
+        java.util.Set<String> existingParticipants = new java.util.HashSet<>(roomService.getRoomParticipants(roomId));
+
         roomService.joinRoom(roomId, sessionId);
 
-        // Notify existing users in the room
-        for (String participantId : roomService.getRoomParticipants(roomId)) {
-            if (!participantId.equals(sessionId)) {
-                SignalMessage notification = SignalMessage.builder()
-                        .type("user-joined")
-                        .roomId(roomId)
-                        .senderId(sessionId)
-                        .build();
-                sendMessage(participantId, notification);
-            }
+        // Send room-info to the new user with existing participants list
+        SignalMessage roomInfo = SignalMessage.builder()
+                .type("room-info")
+                .roomId(roomId)
+                .senderId(sessionId)
+                .participants(new java.util.ArrayList<>(existingParticipants))
+                .build();
+        sendMessage(sessionId, roomInfo);
+
+        // Notify existing users in the room about the new user
+        for (String participantId : existingParticipants) {
+            SignalMessage notification = SignalMessage.builder()
+                    .type("user-joined")
+                    .roomId(roomId)
+                    .senderId(sessionId)
+                    .build();
+            sendMessage(participantId, notification);
         }
 
-        log.info("User {} joined room {}", sessionId, roomId);
+        log.info("User {} joined room {} (existing participants: {})", sessionId, roomId, existingParticipants.size());
     }
 
     private void handleOffer(SignalMessage message) throws IOException {
